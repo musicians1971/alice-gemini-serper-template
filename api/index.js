@@ -5,10 +5,17 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
-// Общий бюджет. Оставляем запас до ограничения времени ответа Алисы.
-const TOTAL_RESPONSE_BUDGET_MS = 3900;
-const SERPER_TIMEOUT_MS = 2400;
-const GEMINI_TIMEOUT_MS = 1100;
+// Общий бюджет: 7,8 секунды с небольшим запасом до 8 секунд.
+const TOTAL_RESPONSE_BUDGET_MS = 7800;
+
+// Serper может отвечать около 2–3 секунд.
+const SERPER_TIMEOUT_MS = 3000;
+
+// Даём Gemini больше времени на анализ и формирование ответа.
+const GEMINI_TIMEOUT_MS = 4500;
+
+// Минимальный запас для обработки результата и ответа Алисе.
+const RESPONSE_RESERVE_MS = 300;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -108,12 +115,17 @@ async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
 
   if (!key) {
-    console.warn("SERPER_SKIP: API key is missing.");
+    console.warn("SERPER_SKIP", JSON.stringify({
+      reason: "API_KEY_MISSING"
+    }));
     return "";
   }
 
   if (timeoutMs < 150) {
-    console.warn("SERPER_SKIP: insufficient time budget.");
+    console.warn("SERPER_SKIP", JSON.stringify({
+      reason: "INSUFFICIENT_TIME",
+      timeoutMs
+    }));
     return "";
   }
 
@@ -178,6 +190,12 @@ async function searchWeb(query, timeoutMs) {
       usableResults: Boolean(result)
     }));
 
+    if (!result) {
+      console.warn("SERPER_EMPTY_RESULTS", JSON.stringify({
+        durationMs
+      }));
+    }
+
     return result;
   } catch (error) {
     const durationMs = Date.now() - startedAt;
@@ -185,7 +203,7 @@ async function searchWeb(query, timeoutMs) {
     if (error?.name === "AbortError") {
       console.warn("SERPER_TIMEOUT", JSON.stringify({
         durationMs,
-        timeoutMs
+        timeoutMs: Math.min(SERPER_TIMEOUT_MS, timeoutMs)
       }));
     } else {
       console.error("SERPER_NETWORK_ERROR", JSON.stringify({
@@ -194,6 +212,8 @@ async function searchWeb(query, timeoutMs) {
       }));
     }
 
+    // Ошибка поиска не останавливает обработку:
+    // Gemini сможет попробовать ответить без результатов Serper.
     return "";
   }
 }
@@ -223,7 +243,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }));
 
   const prompt = searchContext
-    ? `${text}\n\nРезультаты интернет-поиска:\n${searchContext}\n\nИспользуй эти результаты как источник фактов. Если они не отвечают на вопрос, прямо сообщи об этом. Не утверждай, что поиск не проводился, если результаты переданы.`
+    ? `${text}\n\nРезультаты интернет-поиска:\n${searchContext}\n\nИспользуй эти результаты как источник фактов. При необходимости сопоставь несколько результатов. Если они не отвечают на вопрос, прямо сообщи об этом. Не выдумывай факты и не утверждай, что проверил сведения, которых нет в результатах.`
     : text;
 
   contents.push({
@@ -248,7 +268,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         contents,
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 240
+          maxOutputTokens: 400
         }
       })
     },
@@ -340,6 +360,7 @@ export default async function handler(req, res) {
   }
 
   const startedAt = Date.now();
+
   const remainingMs = () =>
     TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
 
@@ -358,10 +379,13 @@ export default async function handler(req, res) {
     body?.state?.session?.history
   );
 
+  const searchIntent = isSearchIntent(text);
+
   console.log("ALICE_REQUEST", JSON.stringify({
     method: req.method,
     textLength: text.length,
-    searchIntent: isSearchIntent(text)
+    searchIntent,
+    totalBudgetMs: TOTAL_RESPONSE_BUDGET_MS
   }));
 
   if (!text) {
@@ -375,20 +399,42 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
 
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Оставляем время для Gemini и формирования ответа Алисы.
+    if (searchIntent && process.env.SERPER_API_KEY) {
+      // Резервируем до 4,5 секунды для Gemini и 300 мс
+      // для формирования ответа. Serper получает остаток бюджета.
       const searchBudget = Math.min(
         SERPER_TIMEOUT_MS,
-        Math.max(0, remainingMs() - 2300)
+        Math.max(
+          0,
+          remainingMs() - GEMINI_TIMEOUT_MS - RESPONSE_RESERVE_MS
+        )
       );
 
+      console.log("SERPER_START", JSON.stringify({
+        timeoutMs: searchBudget,
+        remainingMs: remainingMs()
+      }));
+
       searchContext = await searchWeb(text, searchBudget);
+    } else if (searchIntent) {
+      console.warn("SERPER_SKIP", JSON.stringify({
+        reason: "API_KEY_MISSING"
+      }));
     }
 
     const geminiBudget = Math.max(
       0,
-      Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300)
+      Math.min(
+        GEMINI_TIMEOUT_MS,
+        remainingMs() - RESPONSE_RESERVE_MS
+      )
     );
+
+    console.log("GEMINI_START", JSON.stringify({
+      timeoutMs: geminiBudget,
+      remainingMs: remainingMs(),
+      searchContextUsed: Boolean(searchContext)
+    }));
 
     const answer = await askGemini(
       text,
@@ -411,6 +457,7 @@ export default async function handler(req, res) {
 
     console.log("ALICE_RESPONSE", JSON.stringify({
       elapsedMs: Date.now() - startedAt,
+      remainingMs: remainingMs(),
       searchUsed: Boolean(searchContext)
     }));
 
@@ -423,13 +470,11 @@ export default async function handler(req, res) {
         ? new Error("TIME_BUDGET_EXHAUSTED")
         : error;
 
-    console.warn(
-      "ALICE_FALLBACK",
-      JSON.stringify({
-        elapsedMs: Date.now() - startedAt,
-        error: safeError?.message || "unknown error"
-      })
-    );
+    console.warn("ALICE_FALLBACK", JSON.stringify({
+      elapsedMs: Date.now() - startedAt,
+      remainingMs: remainingMs(),
+      error: safeError?.message || "unknown error"
+    }));
 
     return res.status(200).json(
       aliceResponse(errorForUser(safeError), false, oldHistory)
