@@ -7,8 +7,8 @@ const MAX_ALICE_TEXT = 1024;
 
 // Общий бюджет. Оставляем запас до ограничения времени ответа Алисы.
 const TOTAL_RESPONSE_BUDGET_MS = 3900;
-const SERPER_TIMEOUT_MS = 1500;
-const GEMINI_TIMEOUT_MS = 2100;
+const SERPER_TIMEOUT_MS = 2400;
+const GEMINI_TIMEOUT_MS = 1100;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
